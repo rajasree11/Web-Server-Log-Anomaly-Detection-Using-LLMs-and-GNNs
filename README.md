@@ -2,7 +2,7 @@
 
 This repository contains the implementation of the paper:
 
-"Comparative Analysis of Large Language Models and Graph Neural Networks for Web Server Log Anomaly Detection"
+"Anomaly Detection in Server Logs Using Large Language Models and Graph Neural Networks"
 
 ## Frameworks
 
