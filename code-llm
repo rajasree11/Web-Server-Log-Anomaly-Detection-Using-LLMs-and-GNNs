@@ -1,0 +1,185 @@
+!pip install torch transformers datasets bitsandbytes peft accelerate loralib matplotlib --quiet
+import os
+from huggingface_hub import login
+
+os.environ["HF_TOKEN"] = "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" 
+login(token=os.getenv("HF_TOKEN"))
+import re
+import torch
+import pandas as pd
+from collections import defaultdict
+from transformers import default_data_collator
+from transformers import AutoTokenizer
+from torch.utils.data import DataLoader
+from transformers import AutoModelForSequenceClassification, Trainer, TrainingArguments
+from sklearn.metrics import accuracy_score
+
+# Load tokenizer
+tokenizer = AutoTokenizer.from_pretrained("mistralai/Mistral-7B-Instruct-v0.1")
+tokenizer.pad_token = tokenizer.eos_token
+
+# Load logs
+log_path = "/kaggle/input/dataset/logs.txt"
+with open(log_path, "r") as f:
+    raw_logs = f.readlines()
+
+# Initialize containers
+logs = []
+labels = []
+ip_counter = defaultdict(int)
+
+
+# Regex pattern to extract fields from logs
+pattern = re.compile(r'(?P<IP>\S+) - - \[(?P<Timestamp>.*?)\] "(?P<Request>.*?)" (?P<Status>\d+) (?P<Bytes>\S+) "(?P<Referrer>.*?)" "(?P<UserAgent>.*?)"')
+attack_keywords = ["sql", "brute", "ddos", "phishing", "unauthorized"]
+
+# Custom labeling rules
+def label_log_entry(log):
+    log = log.lower()
+    if "select" in log or "--" in log or "'1'='1" in log or "%2a" in log:
+        return 1
+    if any(code in log for code in [' 400 ', ' 408 ', ' 500 ', ' 501 ']):
+        return 1
+    if re.search(r"/\?search=(\s*|home|technology|event|song|street|computer)", log):
+        return 1
+    if "/.robots.txt" in log and not log.strip().endswith("200 0 \"-\""):
+        return 1
+    if '"' in log:
+        parts = log.split('"')
+        if len(parts) > 5:
+            ua = parts[-1]
+            if ua.strip() in ["-", "", "curl", "python-requests"]:
+                return 1
+    return 0
+
+# Apply rules to logs
+for line in raw_logs:  
+    match = pattern.match(line)
+    if match:
+        ip, ts, req, status, _, ref, agent = match.groups()
+        text = f"{ip} | {ts} | {req} | {status} | {ref} | {agent}"
+        if len(text.strip()) > 30 and len(text.strip().split()) > 6:
+            lower_text = text.lower()
+            rule1 = label_log_entry(lower_text)
+            rule2 = 1 if any(k in lower_text for k in attack_keywords) else 0
+            label = 1 if rule1 or rule2 else 0
+            logs.append(text)
+            labels.append(label)
+
+logs = logs[:2000]
+labels = labels[:2000]
+
+# Encode using tokenizer
+encoded = tokenizer(logs, truncation=True, padding=True, max_length=256, return_tensors="pt")
+input_ids, attention_mask = encoded["input_ids"], encoded["attention_mask"]
+
+# Prepare dataset format for training
+dataset = [
+    {"input_ids": input_ids[i], "attention_mask": attention_mask[i], "labels": torch.tensor(labels[i])}
+    for i in range(len(logs))
+]
+
+# Train-val split
+split_index = int(0.8 * len(logs))
+train_data = dataset[:split_index]
+val_data = dataset[split_index:]
+from torch.utils.data import Dataset
+
+class LogDataset(Dataset):
+    def __init__(self, data):
+        self.data = data
+    def __len__(self):
+        return len(self.data)
+    def __getitem__(self, idx):
+        return self.data[idx]
+
+train_dataset = LogDataset(train_data)
+val_dataset = LogDataset(val_data)
+!pip install -U bitsandbytes --quiet
+from transformers import AutoModelForSequenceClassification, BitsAndBytesConfig
+from peft import get_peft_model, LoraConfig, prepare_model_for_kbit_training
+
+bnb_config = BitsAndBytesConfig(load_in_4bit=True, bnb_4bit_compute_dtype=torch.float16)
+
+model = AutoModelForSequenceClassification.from_pretrained(
+    "mistralai/Mistral-7B-Instruct-v0.1",
+    quantization_config=bnb_config,
+    num_labels=2,
+    device_map="auto",
+     pad_token_id=tokenizer.pad_token_id
+)
+
+model = prepare_model_for_kbit_training(model)
+import torch.utils.checkpoint
+torch.utils.checkpoint.use_reentrant = False 
+lora_config = LoraConfig(
+    r=8, lora_alpha=16, target_modules=["q_proj", "v_proj"], lora_dropout=0.1, bias="none", task_type="SEQ_CLS"
+)
+model = get_peft_model(model, lora_config)
+pip install evaluate --quiet
+from transformers import TrainingArguments, Trainer
+from sklearn.metrics import accuracy_score, f1_score, precision_score, recall_score
+
+# Metric calculation
+def compute_metrics(pred):
+    labels = pred.label_ids
+    preds = pred.predictions.argmax(-1)
+    return {
+        "accuracy": accuracy_score(labels, preds),
+        "f1": f1_score(labels, preds),
+        "precision": precision_score(labels, preds),
+        "recall": recall_score(labels, preds)
+    }
+
+# TrainingArguments for fast mode
+training_args = TrainingArguments(
+    output_dir="/kaggle/working/mistral_finetuned_fast",
+    per_device_train_batch_size=4,
+    gradient_accumulation_steps=4,
+    num_train_epochs=1,
+    eval_strategy="epoch",
+    save_strategy="no",
+    logging_dir="./logs",
+    logging_steps=50,
+    fp16=True,
+    learning_rate=2e-4,
+    load_best_model_at_end=False,
+    report_to="none"
+)
+
+# Trainer setup
+trainer = Trainer(
+    model=model,
+    args=training_args,
+    train_dataset=train_dataset,
+    eval_dataset=val_dataset,
+    data_collator=default_data_collator,
+    compute_metrics=compute_metrics
+)
+
+# Set pad token ID
+model.config.pad_token_id = tokenizer.pad_token_id
+
+# Train
+train_result = trainer.train()
+
+# Extract training loss
+train_loss = getattr(train_result, 'training_loss', None)
+
+# Final evaluation
+metrics = trainer.evaluate(eval_dataset=val_dataset)
+
+# Results
+print("\n📈 Final Evaluation Metrics:")
+if train_loss is not None:
+    print(f"Training Loss   : {train_loss:.4f}")
+print(f"Validation Loss : {metrics['eval_loss']:.4f}")
+print(f"Accuracy        : {metrics['eval_accuracy']:.4f}")
+print(f"Precision       : {metrics['eval_precision']:.4f}")
+print(f"Recall          : {metrics['eval_recall']:.4f}")
+print(f"F1 Score        : {metrics['eval_f1']:.4f}")
+
+# 💾 Save model and tokenizer
+trainer.save_model("/kaggle/working/mistral_finetuned_fast")
+tokenizer.save_pretrained("/kaggle/working/mistral_finetuned_fast")
+
